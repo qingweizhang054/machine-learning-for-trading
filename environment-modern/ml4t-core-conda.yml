@@ -1,0 +1,16 @@
+name: ml4t-core
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - numpy=1.26
+  - pandas=2.2
+  - scipy
+  - scikit-learn
+  - statsmodels
+  - ipykernel
+  - jupyterlab
+  - matplotlib
+  - seaborn
+prefix: /home/qzhan054/miniforge3/envs/ml4t-core
