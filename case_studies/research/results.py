@@ -27,14 +27,14 @@ from .contracts import ExecutionTier
 _VERIFIED_ARTIFACT_DIGESTS: dict[tuple[str, int, int], str] = {}
 
 
-def _verified_digest(path: Path, load) -> str:
+def _verified_digest(path: Path, load, digest_fn=None) -> str:
     from case_studies.utils.artifact_digest import value_digest
 
     stat = path.stat()
     key = (str(path), stat.st_mtime_ns, stat.st_size)
     digest = _VERIFIED_ARTIFACT_DIGESTS.get(key)
     if digest is None:
-        digest = value_digest(load())
+        digest = (digest_fn or value_digest)(load())
         _VERIFIED_ARTIFACT_DIGESTS[key] = digest
     return digest
 
@@ -215,6 +215,33 @@ class Result:
                         backtest["identity_version"],
                         origin,
                     )
+        # A causal hash is a real row in the same registry file, and saying "unknown" about
+        # it sends the reader looking for a run that is sitting right there. `Result` models
+        # training, prediction and backtest; causal runs are registered by
+        # `register_causal_run` into `causal_runs` and read through
+        # `case_studies.research.causal.CausalResult`, which is a separate model because a
+        # causal identity has no training hash to hang off. Checked only on the way out, so
+        # the found path pays nothing for it.
+        for root, _namespace, _origin in roots:
+            db_path = root / "run_log" / "registry.db"
+            if not db_path.exists():
+                continue
+            with closing(sqlite3.connect(db_path)) as db:
+                has_table = db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'causal_runs'"
+                ).fetchone()
+                if has_table is None:
+                    continue
+                row = db.execute(
+                    "SELECT 1 FROM causal_runs WHERE causal_hash = ?", (result_hash,)
+                ).fetchone()
+            if row is not None:
+                raise KeyError(
+                    f"{result_hash!r} is a causal run in {db_path}, which Result does not "
+                    "model. Read it with case_studies.research.causal.CausalResult.open("
+                    "study, causal_hash), and note that migrate_equivalent_training_identity "
+                    "does not reach causal rows - a causal re-run refits rather than migrates."
+                )
         raise KeyError(f"Unknown result hash {result_hash!r}")
 
     @property
@@ -323,6 +350,47 @@ class Result:
             "split": split,
             "execution_tier": self.execution_tier,
         }
+
+
+def normalized_feature_artifacts(value: Any) -> Any:
+    """`computation.feature_artifacts` as the set of inputs it names, whatever its shape.
+
+    Seven producers write this field and six of them write `mds.input_lineage["artifacts"]` -
+    `{role: {"sha256": <hex>, "size": <int>}}` - while the latent adapter writes
+    `case.input_data_spec["files"]`, a list of `{"role": ..., "sha256": "sha256:<hex>"}`
+    (ml4t/agent-workspace#891). The two are the same statement in different words. Measured on
+    `etfs` 2026-09-07, one latent and one linear run at `fwd_ret_21d`: the same three roles -
+    financial, label, model_based - carrying the same three sha256 values, rendered one way
+    with a prefix and no size and the other way with a size and no prefix.
+
+    So a candidate set spanning both families refused on `feature_artifacts` for two members
+    that were fitted on identical files, and the only way past it was to declare the field
+    comparable - which silences the check for the members it could legitimately compare.
+
+    The comparison asks whether two members were fitted on the same inputs. That is a question
+    about which files, by content, and not about how a producer serialized the answer, so it is
+    asked over `{role: <content hash>}`. `size` is dropped because a file's length is decided
+    by its content and adds nothing a sha256 has not already said.
+
+    Anything this does not recognize is returned unchanged, so an unfamiliar shape still
+    compares exactly rather than silently comparing equal to everything.
+    """
+    if isinstance(value, dict) and all(isinstance(item, dict) for item in value.values()):
+        return {
+            str(role): _content_hash(record.get("sha256")) for role, record in sorted(value.items())
+        }
+    if isinstance(value, list) and all(
+        isinstance(item, dict) and "role" in item and "sha256" in item for item in value
+    ):
+        return {str(item["role"]): _content_hash(item["sha256"]) for item in value}
+    return value
+
+
+def _content_hash(value: Any) -> Any:
+    """A sha256 with or without its `sha256:` prefix, as the bare digest."""
+    if isinstance(value, str) and value.startswith("sha256:"):
+        return value[len("sha256:") :]
+    return value
 
 
 @dataclass(frozen=True)
@@ -445,7 +513,17 @@ class PredictionResult(Result):
         recorded_digest = coverage.get("artifact_digest")
         if recorded_digest:
             try:
-                if _verified_digest(prediction_file, self.load) != recorded_digest:
+                # The same digest `register_prediction_set` recorded: the frame's `label`
+                # column states which declaration a coverage check should apply to it and is
+                # not part of its content identity (ml4t/agent-workspace#887), so a labelled
+                # artifact and the unlabelled one written before the column existed digest
+                # alike and neither reports incomplete.
+                from case_studies.utils.artifact_digest import published_prediction_digest
+
+                if (
+                    _verified_digest(prediction_file, self.load, published_prediction_digest)
+                    != recorded_digest
+                ):
                     return f"{prediction_file} does not match its recorded digest"
             except (OSError, ValueError, pl.exceptions.PolarsError):
                 return f"{prediction_file} could not be read to verify its digest"
@@ -610,7 +688,24 @@ class ResultsCatalog:
             # A table column, not part of `resolved`, so recording it moves no training hash.
             # `spec_json.provenance.entry_point` is a different field naming the runner module
             # (`case_studies.utils.linear`); this one names the notebook.
-            entry_point=self.study.entry_point,
+            #
+            # Falls back to the request's own `notebook_path` when the Study was not told. Those
+            # are the same fact declared in two places - `open_study(entry_point=...)` sets the
+            # column, `build_requests(notebook=...)` sets the provenance field - and a notebook
+            # that declares one and not the other is the common state rather than the exception:
+            # measured 2026-09-12 over the 53 notebooks calling `run_model_population`, 20 declare
+            # `entry_point`, 13 declare only `notebook`, and 20 declare neither. Without this the
+            # 13 register a NULL column while carrying the answer in the row they are writing.
+            # The column is NULL on 785 of the 1160 training rows across the nine production
+            # registries; only nasdaq100_microstructure and sp500_equity_option_analytics, whose
+            # notebooks all declare `entry_point`, are clean.
+            #
+            # The direction is fixed by the decision recorded in `tests/test_model_registry.py`
+            # (2026-08-25): the COLUMN is the half that survives when the migration finishes, and
+            # `json_extract(runtime_json, '$.notebook_path')` is the half that goes. So provenance
+            # fills the column, never the reverse. An explicit `entry_point` still wins, because a
+            # Study told which notebook it serves was told deliberately.
+            entry_point=self.study.entry_point or (runtime_provenance or {}).get("notebook_path"),
             runtime_provenance=runtime_provenance,
             # Defaulted here rather than at every call site: a caller that forgets it should
             # still leave a legible row, and "when the identity was registered" is within
@@ -701,5 +796,21 @@ class ResultsCatalog:
                 partial.append((result_hash, reason))
         return partial
 
-    def open(self, result_hash: str, *, include_preview: bool = False) -> Result:
+    def open(self, result_hash: str, *, include_preview: bool | None = None) -> Result:
+        """Resolve a hash out of this study's registry, in this study's own tier.
+
+        `include_preview` defaults to the study's `execution_tier`, not to False. Every
+        caller arrives here with a hash it read out of *this* study's registry, so under a
+        preview study that hash lives in the preview registry and nowhere else. A fixed
+        False sent all of them to search canonical and released only, and
+        `open_selection_field`'s live ranking raised KeyError on the first member it had
+        just ranked. `declare_official_population` had already worked around it by passing
+        True at its own call site; deciding it here covers the three that had not.
+
+        Under a canonical study the default is False exactly as before, and even when it is
+        True `Result.open` appends the preview root *after* canonical and released, so a
+        hash that resolves canonically still resolves canonically.
+        """
+        if include_preview is None:
+            include_preview = self.study.execution_tier is ExecutionTier.PREVIEW
         return Result.open(self.study, result_hash, include_preview=include_preview)

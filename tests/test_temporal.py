@@ -27,12 +27,16 @@ from case_studies.utils.temporal import (
     arima_one_step_forecast,
     filtered_state_probs,
     fit_hmm_kmeans_init,
+    fit_wasserstein_kmeans,
     garch11_conditional_volatility,
+    lift_stream,
     refit_boundaries,
     relabel_states,
     sort_states_by_mean,
     sort_states_by_variance,
     walk_forward_feature,
+    wasserstein_barycenter_1d,
+    wasserstein_distance_1d,
     write_model_based,
 )
 
@@ -300,9 +304,34 @@ WRITE_KW = dict(
 )
 
 
+def _geometry(folds: tuple[int, ...] = (0, 1)) -> list[dict]:
+    """The declaration a fold-scoped write must carry (ml4t/agent-workspace#994).
+
+    The frame states which fold ids exist and never states what bounded them, so
+    `write_model_based` refuses a fold-scoped artifact that does not declare its geometry.
+    The boundaries here are arbitrary and ordered; nothing in these tests reads them.
+    """
+    return [
+        {
+            "fold": fold,
+            "train_start": datetime(2020, 1, 1).isoformat(),
+            "train_end": (datetime(2020, 1, 1) + timedelta(days=fold)).isoformat(),
+            "val_start": (datetime(2020, 1, 2) + timedelta(days=fold)).isoformat(),
+            "val_end": (datetime(2020, 1, 6) + timedelta(days=fold)).isoformat(),
+        }
+        for fold in folds
+    ]
+
+
 def test_write_model_based_writes_the_artifact_and_its_sidecar(tmp_path: Path) -> None:
     out = tmp_path / "model_based.parquet"
-    record = write_model_based(_emit_frame(), out, expected_folds=[0, 1], **WRITE_KW)
+    record = write_model_based(
+        _emit_frame(),
+        out,
+        expected_folds=[0, 1],
+        metadata={"fold_geometry": _geometry()},
+        **WRITE_KW,
+    )
     assert out.exists()
     assert record["n_rows"] == 36
     assert pl.read_parquet(out).height == 36
@@ -315,7 +344,9 @@ def test_write_model_based_records_where_each_feature_starts(tmp_path: Path) -> 
         .otherwise(pl.col("garch_sigma"))
         .alias("garch_sigma")
     )
-    record = write_model_based(frame, tmp_path / "m.parquet", **WRITE_KW)
+    record = write_model_based(
+        frame, tmp_path / "m.parquet", metadata={"fold_geometry": _geometry()}, **WRITE_KW
+    )
     geometry = {(g["fold"], g["feature"]): g for g in record["fold_feature_geometry"]}
     # The warm-up is visible in the sidecar rather than only in the values, which is the
     # whole point: the defect it stands for left no trace anywhere before this.
@@ -333,7 +364,12 @@ def test_write_model_based_rejects_a_duplicated_row_within_a_fold(tmp_path: Path
 
 def test_write_model_based_allows_the_same_key_in_two_folds(tmp_path: Path) -> None:
     # The identity is key + fold, not key: every fold re-emits the same panel rows.
-    record = write_model_based(_emit_frame(folds=(0, 1, 2)), tmp_path / "m.parquet", **WRITE_KW)
+    record = write_model_based(
+        _emit_frame(folds=(0, 1, 2)),
+        tmp_path / "m.parquet",
+        metadata={"fold_geometry": _geometry((0, 1, 2))},
+        **WRITE_KW,
+    )
     assert record["n_rows"] == 54
 
 
@@ -1224,3 +1260,98 @@ def test_the_arima_filter_walks_forward_without_reading_its_future() -> None:
         n_features=1,
     )
     assert np.allclose(values[:240, 0], shorter[:, 0], equal_nan=True)
+
+
+# ---------------------------------------------------------------------------
+# The Wasserstein regime estimator.
+# ---------------------------------------------------------------------------
+
+
+def test_lift_stream_advances_by_the_window_less_the_overlap() -> None:
+    """Windows share `overlap` observations, and a trailing partial window is dropped."""
+    returns = np.arange(100, dtype=float)
+    lifted = lift_stream(returns, window_len=21, overlap=5)
+
+    assert lifted.step == 16
+    assert lifted.segments.shape[1] == 21
+    assert np.array_equal(lifted.starts, np.arange(0, lifted.segments.shape[0] * 16, 16))
+    assert np.array_equal(lifted.segments[0], returns[:21])
+    assert np.array_equal(lifted.segments[1], returns[16:37])
+    # 100 observations hold five complete windows opening at 0, 16, 32, 48 and 64; the sixth
+    # would open at 80 and run to 101.
+    assert lifted.segments.shape[0] == 5
+    assert np.array_equal(lifted.sorted_segments, np.sort(lifted.segments, axis=1))
+
+
+def test_the_wasserstein_distance_between_a_sample_and_its_shift_is_the_shift() -> None:
+    """Equal-sized 1D samples match by rank, so a pure translation costs exactly the shift."""
+    rng = np.random.default_rng(0)
+    a = np.sort(rng.normal(size=64))
+    assert wasserstein_distance_1d(a, a) == pytest.approx(0.0)
+    assert wasserstein_distance_1d(a, a + 0.25) == pytest.approx(0.25)
+    assert wasserstein_distance_1d(a, a + 0.25, p=2.0) == pytest.approx(0.25)
+
+
+def test_the_barycenter_is_taken_rank_by_rank() -> None:
+    """Rank by rank, and the median at ``p=1`` against the mean at ``p=2``.
+
+    The members are spaced asymmetrically so the two disagree: rank 0 draws from 0, 10 and
+    50, whose median is 10 and whose mean is 20. Evenly spaced members would let an
+    implementation that always took the mean pass both assertions.
+    """
+    members = np.array([[0.0, 1.0, 2.0], [10.0, 11.0, 12.0], [50.0, 51.0, 52.0]])
+    assert np.array_equal(wasserstein_barycenter_1d(members, p=1.0), [10.0, 11.0, 12.0])
+    assert np.array_equal(wasserstein_barycenter_1d(members, p=2.0), [20.0, 21.0, 22.0])
+    # Each output atom is built from one rank of the members, so the result is a
+    # distribution and not a pooled average of the nine numbers, which is 21.0.
+    assert wasserstein_barycenter_1d(members, p=2.0)[0] != pytest.approx(members.mean())
+
+
+def test_a_restart_is_scored_against_the_centroids_it_returns() -> None:
+    """The assignment pass that scores a restart runs after its last centroid update.
+
+    It used to run before: the loop scored `dists` and `labels` from the pass at the top of
+    the final iteration, while the centroids returned were the ones that iteration went on to
+    produce. A restart that converged was unaffected, because the update it broke on moved the
+    centroids by less than `atol` - but one that stopped on `max_iter` returned labels that
+    were the nearest centroids of a set it did not return, and an inertia describing that same
+    stale set, so the wrong restart could win.
+
+    `max_iter=1` makes every restart stop that way, and one unstructured blob makes the
+    partition move on every update rather than settling immediately. Under the previous
+    implementation these labels disagree with the returned centroids.
+    """
+    rng = np.random.default_rng(0)
+    segments = np.sort(rng.normal(size=(40, 12)), axis=1)
+
+    labels, centroids = fit_wasserstein_kmeans(
+        segments, n_clusters=2, max_iter=1, n_init=3, random_state=1
+    )
+    nearest = np.stack(
+        [wasserstein_distance_1d(segments, centroids[k][None, :]) for k in range(2)], axis=1
+    ).argmin(axis=1)
+
+    assert np.array_equal(labels, nearest)
+
+
+def test_wasserstein_kmeans_separates_two_distributions_and_is_reproducible() -> None:
+    """Two well-separated blobs come back as two clusters, identically on the same seed."""
+    # Same mean, so the two are told apart by their spread and not by their level, which is
+    # what the feature claims. The gap is wide because a narrow one is genuinely ambiguous: at
+    # 0.5 against 4.0 one draw of sixteen from the wide blob is calmer than the calm ones and
+    # clusters with them, which is the estimator being right about that window.
+    rng = np.random.default_rng(7)
+    calm = rng.normal(0.0, 0.2, size=(30, 16))
+    turbulent = rng.normal(0.0, 10.0, size=(30, 16))
+    segments = np.sort(np.concatenate([calm, turbulent]), axis=1)
+
+    labels, centroids = fit_wasserstein_kmeans(segments, n_clusters=2, random_state=42)
+
+    assert centroids.shape == (2, 16)
+    assert len(np.unique(labels[:30])) == 1
+    assert len(np.unique(labels[30:])) == 1
+    assert labels[0] != labels[30]
+
+    again, again_centroids = fit_wasserstein_kmeans(segments, n_clusters=2, random_state=42)
+    assert np.array_equal(labels, again)
+    assert np.array_equal(centroids, again_centroids)

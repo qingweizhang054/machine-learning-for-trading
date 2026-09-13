@@ -16,16 +16,32 @@
 # %% [markdown]
 # # Portfolio Allocation - FX Pairs
 #
-# This notebook compares allocation methods after the equal-weight baseline. Production advances
-# the ten model configurations with highest validation backtest Sharpe for each label. Each carries
-# its best checkpoint and signal mapping into the allocation comparison. Preview mode uses a
-# deterministic reduced catalog selection and never writes an official population or candidate set.
+# The baseline backtests answered whether a model's ranking is worth trading at all, by holding
+# every selected pair in equal size. That deliberately confounds two decisions. Which pairs to
+# hold comes from the model; how much to hold in each comes from nothing, because equal weight
+# is the choice not to choose. This notebook separates them: it takes the positions the baseline
+# already selected and varies only the sizing rule.
+#
+# The separation is what makes the comparison readable. If a run changed the allocator and the
+# signal together and the Sharpe improved, there would be no way to say which change earned it.
+# So the prediction, the `top_k` mapping, the cost model and the execution assumptions all pass
+# through from the winning baseline untouched, and the notebook enforces that rather than
+# assuming it: after every allocation result is computed, its strategy specification is compared
+# leaf by leaf against its baseline sibling, and a difference in any field that is not an
+# allocation field is an error. Without that check, "allocation improved Sharpe" would be a
+# statement about whatever else happened to move with it.
+#
+# Production advances the ten model configurations with the highest validation backtest Sharpe
+# for each label, each carrying its own best checkpoint and signal mapping. Preview mode uses a
+# deterministic reduced catalog selection and never writes an official population or candidate
+# set, so a reduced run cannot publish a partial grid under a canonical name.
 #
 # **Learning objectives**
 #
 # - Select configurations from an immutable equal-weight candidate set.
 # - Preserve the selected checkpoint and signal mapping when configurations advance to allocation.
 # - Change allocation while holding prediction, signal, costs, and execution fixed.
+# - Recognise why a sweep declares its expected results before it computes any of them.
 #
 # **Book reference**: Chapter 17
 #
@@ -52,6 +68,7 @@ from case_studies.research import (
     plan_backtests,
     population_supersedes,
     research_name,
+    reuse_disclosure,
     run_backtests,
     strategy_warmup_periods,
     superseded_members,
@@ -77,20 +94,35 @@ RUN_SWEEP = True
 FORCE_REBACKTEST = False
 POPULATION_NAME = ""
 BASELINE_POPULATION_NAME = None
-SUPERSEDES_ALLOCATION_BACKTESTS: str = "e487eb0d75db"
+# `e487eb0d75db` was in no lineage the registry holds, and this notebook builds the name it
+# publishes under with `research_name`, so nothing could look it up to say whether it was
+# dead or waiting for a first publication. `"live"` names the lineage instead and is
+# resolved against that name at run time.
+SUPERSEDES_ALLOCATION_BACKTESTS: str = "live"
 
 # A candidate set is sealed once written, so a run whose members differ from the recorded
 # generation has to name the set it replaces - the same shape 15_risk_management and 16_costs
-# already carry, and keyed by the full set name because that is what the refusal prints. These
-# three moved when 10a_dl_lstm registered the lstm_h64 checkpoints the training menu declares:
-# the equal-weight baselines went from 1,452 to 1,572, so every label's candidate set gained
-# the 40 backtests riding the new predictions. Resolved through `candidate_set_supersedes`
-# rather than passed straight to `create`, because a reader's clean clone has no generation to
-# supersede and `create` refuses a first version that claims to replace one.
+# already carry, and keyed by the full set name because that is what the refusal prints.
+# Resolved through `candidate_set_supersedes` rather than passed straight to `create`, because
+# a reader's clean clone has no generation to supersede and `create` refuses a first version
+# that claims to replace one.
+#
+# `"live"` names the lineage rather than a generation of it, which is what stops these going
+# stale again. The hashes it replaces - `77b9631c7f13`, `1c6a3826af9f`, `db7b24f2a58b` - were in
+# no lineage the registry holds. All three lineages were reset and restarted rather than
+# superseded: each live head carries `supersedes_hash` NULL, so it is generation one under its
+# name. A membership move - which is what an earlier note described, the equal-weight baselines
+# going from 1,452 to 1,572 when 10a_dl_lstm registered the lstm_h64 checkpoints - would have
+# left the old hash as the head's `supersedes_hash`. It is not there, so that was a different
+# event from the one these hashes came through, and the old values are not recoverable.
+#
+# Naming the head instead would be correct only until the next run of whichever notebook freezes
+# these sets, because `create` accepts the head and nothing else and the head moves on every
+# publish. See `case_studies.research.population.SUPERSEDES_LIVE`.
 SUPERSEDES_CANDIDATE_SETS: dict[str, str] = {
-    "fx_pairs:fwd_ret_1d:equal-weight-candidates": "77b9631c7f13",
-    "fx_pairs:fwd_ret_5d:equal-weight-candidates": "1c6a3826af9f",
-    "fx_pairs:fwd_ret_21d:equal-weight-candidates": "db7b24f2a58b",
+    "fx_pairs:fwd_ret_1d:equal-weight-candidates": "live",
+    "fx_pairs:fwd_ret_5d:equal-weight-candidates": "live",
+    "fx_pairs:fwd_ret_21d:equal-weight-candidates": "live",
 }
 
 # %% [markdown]
@@ -99,6 +131,24 @@ SUPERSEDES_CANDIDATE_SETS: dict[str, str] = {
 # Canonical execution reads the exact population frozen by the baseline notebook. Its label-specific
 # candidate sets provide the only performance ranking used here. The selected unit is a model
 # configuration. After a configuration advances, its best checkpoint and signal mapping advance.
+#
+# Reading the frozen population rather than rebuilding the catalog is the point of this cell, and
+# the reason is worth stating because the shortcut looks harmless. This notebook could query the
+# registry for complete validation predictions itself and get a list that looks right. It would
+# not be the list the baselines were computed from: a narrowed upstream run covers fewer labels
+# than the catalog holds, so reconstructing the input here means reproducing another notebook's
+# reduction by convention, and a convention that drifts produces a comparison whose two sides
+# were never measured on the same set.
+#
+# One filter below carries a failure that no output frame can show. `identity_status ==
+# "current"` records the schema version a row was written under. It says nothing about whether
+# the notebook that produced the row still publishes it. When a model notebook refits, the
+# generation it replaced stays in the registry, complete and marked current, and a filter on
+# those three columns alone pulls it into the sweep. Nothing errors. Every backtest runs, every
+# Sharpe is computed correctly, and the table at the end looks exactly as it should - while part
+# of the grid rests on predictions the baseline population no longer contains. `superseded_members`
+# reads the lineage instead of the status column, which is the only way the retired generation is
+# visible at all.
 
 # %%
 set_global_seeds(SEED)
@@ -125,6 +175,35 @@ include_preview = EXECUTION_TIER == "preview"
 
 def _resolve_baseline_scope(output_scope: str, input_scope: str | None) -> str:
     return output_scope if input_scope is None else input_scope
+
+
+def _scope_baseline_labels(
+    baseline_labels: list[str], catalog_labels: list[str], population_name: str
+) -> list[str]:
+    """Restrict the baseline's labels to the ones this run's catalog actually holds.
+
+    A scoped run may narrow the catalog to one label - the ordinary shape of a
+    single-label partial re-run - while still reading the canonical baseline
+    population, which carries every label. The equality guard on the canonical path
+    deliberately does not apply to a scoped run, so without this the caller iterates
+    labels the catalog does not hold: it writes a candidate set for each of them, and
+    then the catalog lookup fails naming the baseline rather than the label mismatch
+    that caused it.
+
+    An unscoped run is returned unchanged, because there the equality guard has
+    already established that the two label sets agree and narrowing here would hide a
+    disagreement rather than report it.
+    """
+    if not population_name:
+        return baseline_labels
+    held = set(catalog_labels)
+    scoped = [label for label in baseline_labels if label in held]
+    if not scoped:
+        raise RuntimeError(
+            "the equal-weight baselines carry none of the catalog's labels: "
+            f"baselines {baseline_labels}, catalog {sorted(held)}"
+        )
+    return scoped
 
 
 baseline_population_name = _resolve_baseline_scope(POPULATION_NAME, BASELINE_POPULATION_NAME)
@@ -252,6 +331,26 @@ if any(result.registry_record()["stage"] != "signal" for result in baseline_resu
 # Production ranks the complete baseline results for each label. The first result for a model
 # configuration is its best checkpoint and signal mapping by validation Sharpe. That result occupies
 # one declared slot and is the only member of the configuration that advances.
+#
+# The deduplication is what makes the ten slots comparable across families. A configuration is
+# backtested once per checkpoint and once per `top_k` mapping, so a family that saves ten
+# checkpoints enters the ranking with ten results and a family that saves two enters with two.
+# Taking the ten best results outright would hand most of the grid to whichever family happened
+# to checkpoint most often, and the allocation comparison would then be reporting a difference in
+# training bookkeeping. `_select_configuration_survivors` keeps the best result per distinct
+# `(family, config_name)` and drops the rest, so each configuration occupies exactly one slot and
+# arrives with the checkpoint that earned it.
+#
+# The `top_k` that travels with the configuration is read from the winning result's own
+# specification, never restated here. `TOP_K` is a check rather than a setting for that reason:
+# a reduced run that passes a different value does not quietly re-map the positions, it raises.
+# A silent re-map would change which pairs are held, which is exactly the variable this notebook
+# exists to hold fixed, and the resulting table would still be a valid backtest of something.
+#
+# A candidate set is sealed once written. That is why a run whose membership has changed has to
+# name the generation it replaces rather than overwrite it: the ranking that selected these ten
+# configurations is itself a published object, and a later reader has to be able to see the set
+# the selection was made from, not the set that exists now.
 
 # %% tags=["results"]
 top_n = TOP_N_CONFIGS or get_top_n_predictions(CASE_STUDY_ID, "allocation")
@@ -271,6 +370,9 @@ if not POPULATION_NAME and baseline_labels != sorted(catalog.get_column("label")
         "the canonical baseline population does not cover every label in the catalog: "
         f"baselines {baseline_labels}, catalog {sorted(catalog.get_column('label').unique())}"
     )
+baseline_labels = _scope_baseline_labels(
+    baseline_labels, sorted(catalog.get_column("label").unique()), POPULATION_NAME
+)
 
 for label in baseline_labels:
     label_results = [result for result in baseline_results if _result_config(result)[0] == label]
@@ -338,6 +440,27 @@ selected.select(
 # Each request changes only the allocator. The selected prediction and `top_k` mapping pass directly
 # from the winning baseline result to the shared backtest boundary. Production freezes every
 # expected identity before the first allocation result is written.
+#
+# Freezing first is what makes the published population a claim rather than a report. Every
+# expected identity is computed and written down before a single backtest runs, so the set is
+# fixed by the request, not by the outcome. A configuration that fails during execution leaves
+# its slot unfilled and `require_complete` refuses the population; it cannot quietly drop out and
+# leave a smaller grid that still looks whole. The order matters because the alternative -
+# collecting whatever finished and publishing that - produces a population whose membership
+# depends on which runs happened to succeed, which is a selection nobody made deliberately and
+# nobody can see afterwards.
+#
+# The duplicate check on `planned_hashes` guards a quieter version of the same problem. Two
+# allocation requests that differ only in a field outside the identity collapse to one hash, and
+# the grid then contains fewer distinct backtests than the plan table above prints. Nothing
+# fails: the second request finds the first one's result already registered and complete, serves
+# it, and the summary counts it. Comparing the planned hashes against their own set is what
+# turns that into an error instead of a row that agrees with itself.
+#
+# The sleeve ceiling is specific to a long-short account. A `top_k` of *k* holds *k* pairs long
+# and *k* short, so it needs `2k` distinct pairs and cannot exceed half the universe. Above that
+# the request is not a portfolio the account could hold, and the backtest would still produce
+# a return series - one belonging to a position set the strategy could never have taken.
 
 # %%
 allocators = get_allocators(CASE_STUDY_ID)
@@ -413,6 +536,21 @@ if not include_preview:
 # The population is validated in the cell that fills it, because the two are one act: the expected
 # set was written down before the first member ran, and `require_complete` is what turns that
 # declaration into a published result.
+#
+# Execution serves an identity that is already registered and complete instead of recomputing it,
+# which is what makes re-running this notebook affordable and also what makes its summary
+# ambiguous unless the two cases are counted apart. A sweep that recomputed everything and a
+# sweep that recomputed nothing finish with the same population and print the same totals, so
+# the counts below separate what ran from what was served.
+#
+# The per-result comparison against the baseline sibling is the check that the controlled
+# comparison actually held. Each allocation result's strategy specification is projected, the
+# baseline's is projected the same way, and the two are compared at their leaves; a difference in
+# any path that is not an allocation field means something other than the allocator moved. The
+# error reports the divergent paths with both values rather than a bare failure, which is the
+# difference between knowing the comparison broke and knowing where. Nothing in the returns,
+# the Sharpe or the turnover would have shown it: a result that changed the signal as well as
+# the allocator is a correct backtest of a different strategy, and it reads as a clean row.
 
 # %% tags=["results"]
 # A sweep that recomputes everything and a sweep that recomputes nothing print the same summary
@@ -455,7 +593,7 @@ if any(
 
 served = run_status.count("reused")
 print(
-    f"Allocation backtests: {len(allocation_results) - served} computed, {served} served from the registry, "
+    f"Allocation backtests: {reuse_disclosure(len(allocation_results) - served, served)}, "
     f"{len(allocation_results)} in the population"
 )
 
@@ -478,6 +616,10 @@ def _non_allocation_projection(spec: dict[str, Any], *, drop_prices: bool) -> di
     metadata = projected.get("backtest_config", {}).get("metadata")
     if isinstance(metadata, dict):
         metadata.pop("chapter", None)
+        # An absolute filesystem path, and already excluded from the identity hash by
+        # `_HASH_EXCLUDED_METADATA` for that reason. Comparing it here makes the notebook
+        # refuse its own siblings from any checkout but the one that registered the parents.
+        metadata.pop("preset_path", None)
     if drop_prices:
         projected.get("input_identity", {}).pop("prices", None)
     return projected
@@ -549,3 +691,15 @@ else:
 # - Validation Sharpe ranks an immutable equal-weight candidate set for each label.
 # - Each advancing configuration retains its best baseline checkpoint and signal mapping.
 # - Preview reductions exercise the same backtest engine without entering production populations.
+# - One slot per configuration, not per result, so families with more checkpoints do not crowd
+#   out families with fewer. Otherwise the comparison measures checkpointing habits.
+# - The expected population is written before any member runs, so a configuration that fails
+#   leaves a gap rather than shrinking the grid.
+# - Every allocation result is checked against its baseline sibling field by field. Changing the
+#   allocator and something else at the same time produces a valid backtest of a different
+#   strategy, and no output in this notebook would look wrong.
+#
+# What this stage cannot tell you is whether a better-looking allocator is better out of sample.
+# Everything here is measured on validation, the same data the ranking above used, so an
+# allocator that wins by a small margin has been chosen partly for fitting this period's
+# covariance structure. The holdout is what settles that, once, later in the chain.

@@ -48,6 +48,10 @@ from case_studies.sp500_options.research_workflow import (
     official_prediction_catalog,
     open_study,
 )
+from case_studies.utils.registry.completeness import (
+    key_digest_value,
+    require_comparable_key_digests,
+)
 
 MODEL_POPULATIONS = (
     "sp500-options-linear-validation-v1",
@@ -118,7 +122,24 @@ if cv_identities.is_empty() or cv_identities.n_unique() != 1:
 coverage = coverage.join(
     catalog.select("prediction_hash", "family"), on="prediction_hash", how="left"
 )
-for digest, group in coverage.group_by("expected_key_digest"):
+# The grouping below is only meaningful within one key rendering. Two digests taken under
+# different renderings are unequal whatever their key sets, so a mixed population reports more
+# distinct eligibility contracts than exist and tells a reader that two checkpoints scored on
+# identical rows are not comparable - which the dimension check on each group cannot catch,
+# because the split halves agree on every dimension (ml4t/agent-workspace#1065).
+require_comparable_key_digests(
+    coverage.get_column("expected_key_digest"), what="this notebook's model populations"
+)
+# Grouped on the digest value rather than the stored string. A row written before the rendering
+# was stamped and a row written after it carry the same key set as `<value>` and `k2:<value>`,
+# and grouping the strings would split one contract in two for no reason a reader could see -
+# the same mis-grouping the check above refuses, arriving through the prefix instead.
+coverage = coverage.with_columns(
+    pl.col("expected_key_digest")
+    .map_elements(key_digest_value, return_dtype=pl.String)
+    .alias("eligibility")
+)
+for digest, group in coverage.group_by("eligibility"):
     if group.select("n_expected", "n_actual", "n_folds").n_unique() != 1:
         raise RuntimeError(
             f"predictions sharing eligibility {digest[0]} disagree on coverage dimensions"
@@ -127,7 +148,7 @@ for digest, group in coverage.group_by("expected_key_digest"):
         raise RuntimeError(f"eligibility {digest[0]} has predictions short of their declaration")
 
 population_audit = (
-    coverage.group_by("expected_key_digest")
+    coverage.group_by("eligibility")
     .agg(
         pl.col("family").unique().sort().str.join(", ").alias("families"),
         pl.len().alias("predictions"),
@@ -270,9 +291,15 @@ fig.show()
 # corrects for the serial correlation that overlapping labels induce, which is what makes the
 # conventional error too small on this data. The placebo p-value is a permutation test: the
 # treatment is shuffled in blocks long enough to preserve that serial dependence, the estimate is
-# recomputed, and the reported value is the share of shuffles reaching the observed effect. The
-# first asks whether the estimate is distinguishable from zero given the dependence; the second
-# asks whether the procedure would have produced it from a treatment that carries no signal.
+# recomputed, and the reported value is the share of shuffles whose HAC t-statistic reaches the
+# observed one. The comparison is on the t-statistic rather than the effect because a permuted
+# treatment is no longer predictable from the controls, so its residual keeps nearly all its
+# variance - and that variance is the denominator of the second-stage effect. On the effect scale
+# every placebo draw is divided by a larger number than the observed one, which narrows the null in
+# the one direction that makes a refutation read as passed. The t-statistic carries the same
+# denominator and cancels it. The first asks whether the estimate is distinguishable from zero given
+# the dependence; the second asks whether the procedure would have produced it from a treatment that
+# carries no signal.
 #
 # It is resolved as canonical whatever tier this notebook runs at, because the populations above
 # are canonical whatever tier this notebook runs at. Asking a preview run for a preview causal

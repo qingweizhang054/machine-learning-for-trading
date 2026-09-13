@@ -85,6 +85,10 @@ def _causal_fixture(
     mds = SimpleNamespace(
         dataset=frame,
         feature_names=["feature", "treatment", "confounder"],
+        # The resolver projects its load and records the panel's own list, so the double
+        # has to carry both. Equal here because this fixture stands in for an unprojected
+        # panel: the two differ only when a caller narrows the load.
+        panel_feature_names=["feature", "treatment", "confounder"],
         label_col="fwd_ret_8h",
         label_buffer=label_buffer,
         date_col="timestamp",
@@ -234,7 +238,15 @@ def test_causal_pins_the_thread_pool_and_records_it_in_identity(tmp_path, monkey
     def capture(*args, **kwargs):
         passed.append(kwargs["thread_limit"])
         return {
-            "dml_result": {"theta": 0.02, "se_hac": 0.01, "n_obs": 120},
+            "dml_result": {
+                "theta": 0.02,
+                "se_hac": 0.01,
+                "n_obs": 120,
+                # `manual_dml_timeseries` always returns this, and
+                # `run_resolved_causal_request` reads it without a default so a
+                # missing one is a defect rather than a silent NULL in the row.
+                "covariance_type": "driscoll_kraay",
+            },
             "p_value_hac": 0.04,
             "naive_effect": 0.03,
             "confounding_bias_pct": 50.0,
@@ -317,9 +329,11 @@ def test_run_dml_analysis_pins_the_naive_ols_too(monkeypatch) -> None:
             "theta": 0.02,
             "se_hac": 0.01,
             "n_obs": n,
-            "t_stat": 2.0,
+            # `t_stat_hac` and not `t_stat`, and no `hac_lags`: neither of those names is
+            # in what `manual_dml_timeseries` returns, so the stub was answering to a
+            # shape the code under test never sees.
+            "t_stat_hac": 2.0,
             "p_value_hac": 0.04,
-            "hac_lags": 1,
             "n_entities": 1,
             "n_periods": n,
             "hac_maxlags": 1,
@@ -413,7 +427,15 @@ def test_causal_run_registers_once_and_reopens_after_restart(tmp_path, monkeypat
         causal,
         "run_dml_analysis",
         lambda *args, **kwargs: {
-            "dml_result": {"theta": 0.02, "se_hac": 0.01, "n_obs": 120},
+            "dml_result": {
+                "theta": 0.02,
+                "se_hac": 0.01,
+                "n_obs": 120,
+                # `manual_dml_timeseries` always returns this, and
+                # `run_resolved_causal_request` reads it without a default so a
+                # missing one is a defect rather than a silent NULL in the row.
+                "covariance_type": "driscoll_kraay",
+            },
             "p_value_hac": 0.04,
             "naive_effect": 0.03,
             "confounding_bias_pct": 50.0,
@@ -445,6 +467,65 @@ def test_causal_run_registers_once_and_reopens_after_restart(tmp_path, monkeypat
     assert json.loads(json.dumps(reopened.spec)) == reopened.spec
 
 
+def test_the_frozen_fraction_reaches_the_registry_and_survives_a_cache_hit(
+    tmp_path, monkeypatch
+) -> None:
+    """The diagnostic the refutation's own warning names must reach the reader who
+    regenerates the result rather than the one who watched the fit.
+
+    `_assert_placebo_permutation_possible` warns that `placebo_frozen_fraction` has to be
+    read alongside the p-value, and it warns from inside the fit. The second `run()` below
+    is served from cache and performs no fit, so it emits no warning - which is exactly the
+    re-run a reader does to reproduce a published number. Registering the fraction is what
+    makes that reader able to see whether the p-value is biased toward 1.
+    """
+    study, label, _frame = _causal_fixture(tmp_path, monkeypatch)
+    calls = 0
+
+    def run_analysis(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return {
+            "dml_result": {
+                "theta": 0.02,
+                "se_hac": 0.01,
+                "n_obs": 120,
+                # `manual_dml_timeseries` always returns this, and
+                # `run_resolved_causal_request` reads it without a default so a
+                # missing one is a defect rather than a silent NULL in the row.
+                "covariance_type": "driscoll_kraay",
+            },
+            "p_value_hac": 0.04,
+            "naive_effect": 0.03,
+            "confounding_bias_pct": 50.0,
+            "refutation": {
+                "empirical_p": 0.1,
+                "n_successful": 10,
+                "placebo_frozen_fraction": 0.023,
+            },
+        }
+
+    monkeypatch.setattr(causal, "run_dml_analysis", run_analysis)
+    request = study.causal(
+        method="dml",
+        label=label.name,
+        execution_tier="preview",
+        preview_reductions={
+            "max_samples": 240,
+            "max_symbols": 6,
+            "n_folds": 2,
+            "n_placebo": 10,
+        },
+    )
+
+    first = request.run()
+    second = request.run()
+
+    assert calls == 1
+    assert first.metrics["placebo_frozen_fraction"] == pytest.approx(0.023)
+    assert second.metrics["placebo_frozen_fraction"] == pytest.approx(0.023)
+
+
 def test_causal_cache_accepts_provenance_only_drift(tmp_path, monkeypatch) -> None:
     study, label, _frame = _causal_fixture(tmp_path, monkeypatch)
     calls = 0
@@ -453,7 +534,15 @@ def test_causal_cache_accepts_provenance_only_drift(tmp_path, monkeypatch) -> No
         nonlocal calls
         calls += 1
         return {
-            "dml_result": {"theta": 0.02, "se_hac": 0.01, "n_obs": 120},
+            "dml_result": {
+                "theta": 0.02,
+                "se_hac": 0.01,
+                "n_obs": 120,
+                # `manual_dml_timeseries` always returns this, and
+                # `run_resolved_causal_request` reads it without a default so a
+                # missing one is a defect rather than a silent NULL in the row.
+                "covariance_type": "driscoll_kraay",
+            },
             "p_value_hac": 0.04,
             "naive_effect": 0.03,
             "confounding_bias_pct": 50.0,
@@ -606,6 +695,10 @@ def _session_causal_fixture(tmp_path, monkeypatch):
     mds = SimpleNamespace(
         dataset=frame,
         feature_names=["feature", "treatment", "confounder"],
+        # The resolver projects its load and records the panel's own list, so the double
+        # has to carry both. Equal here because this fixture stands in for an unprojected
+        # panel: the two differ only when a caller narrows the load.
+        panel_feature_names=["feature", "treatment", "confounder"],
         label_col="fwd_ret_5d",
         label_buffer="5D",
         date_col="timestamp",
@@ -672,6 +765,10 @@ def _patch_modeling_dataset(monkeypatch, frame, buffer: str = "5D") -> None:
     mds = SimpleNamespace(
         dataset=frame,
         feature_names=["feature", "treatment", "confounder"],
+        # The resolver projects its load and records the panel's own list, so the double
+        # has to carry both. Equal here because this fixture stands in for an unprojected
+        # panel: the two differ only when a caller narrows the load.
+        panel_feature_names=["feature", "treatment", "confounder"],
         label_col="fwd_ret_5d",
         label_buffer=buffer,
         date_col="timestamp",
@@ -977,7 +1074,15 @@ def test_the_registered_row_names_the_notebook_not_the_module(tmp_path, monkeypa
         causal_module,
         "run_dml_analysis",
         lambda *a, **k: {
-            "dml_result": {"theta": 0.02, "se_hac": 0.01, "n_obs": 120},
+            "dml_result": {
+                "theta": 0.02,
+                "se_hac": 0.01,
+                "n_obs": 120,
+                # `manual_dml_timeseries` always returns this, and
+                # `run_resolved_causal_request` reads it without a default so a
+                # missing one is a defect rather than a silent NULL in the row.
+                "covariance_type": "driscoll_kraay",
+            },
             "p_value_hac": 0.04,
             "naive_effect": 0.03,
             "confounding_bias_pct": 50.0,

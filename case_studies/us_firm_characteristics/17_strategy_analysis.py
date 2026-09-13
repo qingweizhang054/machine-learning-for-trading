@@ -127,7 +127,7 @@ from case_studies.utils.strategy_analysis import (
     plot_cost_decay,
     plot_ic_vs_sharpe,
     rank_backtests_on_common_support,
-    resolve_canonical_rank1_lineage,
+    resolve_solvent_carrier,
     select_holdout_self_backtest,
 )
 from utils.paths import display_path, get_case_study_dir, get_output_dir
@@ -142,6 +142,23 @@ from utils.style import COLORS, add_message_title, ml4t_diverging
 # %% tags=["parameters"]
 CASE_STUDY = "us_firm_characteristics"
 SEED = 42
+# Both names stay bound here although nothing below reads them: that is what makes the harness
+# force preview and supply a workspace - `_declares_tier_and_workspace` in `tests/pm_helpers.py`
+# looks for exactly this pair. Without them the canonical branch regenerates in place, which
+# needs symlinks a CI checkout does not have.
+EXECUTION_TIER = "canonical"
+WORKSPACE: str = ""
+
+# %% [markdown]
+# The study is opened before any path or registry read. Under the preview tier, opening it
+# activates a workspace and rewrites `ML4T_OUTPUT_DIR` process-wide; a `CASE_DIR` or a
+# `BacktestExplorer` built first would address the released registry while everything after it
+# reads the preview one. It is opened once and reused - a second `open_study` further down
+# re-activates, and where the two calls disagree about the tier the notebook silently changes
+# registry mid-page.
+
+# %%
+study = open_study(CASE_STUDY, execution_tier=EXECUTION_TIER, workspace=WORKSPACE or None)
 
 # %%
 PRIMARY_LABEL = "fwd_ret_1m"  # setup.yaml primary; benchmark series keyed here
@@ -212,6 +229,7 @@ def _fmt(val: float | None, fmt: str = ".4f") -> str:
 # %%
 from case_studies.utils.cohort_metrics import compute_and_register
 from case_studies.utils.paired_metrics import populate_paired_metrics
+from case_studies.utils.uncertainty import ENTIRE_REGISTRY
 
 _db = CASE_DIR / "run_log" / "registry.db"
 # The prediction sets their publishers still stand behind. `compute_and_register` scopes cohorts
@@ -222,7 +240,7 @@ _db = CASE_DIR / "run_log" / "registry.db"
 # Every declared label stays in - they compete at the baseline, and the selection ranges over
 # all of them - so what is excluded is superseded generations, not variant labels.
 _live_index = split_unpublished_members(
-    open_study(CASE_STUDY),
+    study,
     load_prediction_index(CASE_STUDY, split="validation"),
 )
 LIVE_PREDICTIONS = _live_index.live["prediction_hash"].to_list()
@@ -231,7 +249,9 @@ if not LIVE_PREDICTIONS:
 print(f"Live prediction sets: {len(LIVE_PREDICTIONS):,}")
 # Resolved before the guard because the guard asks about this holdout, not about holdouts
 # in general. §6 re-resolves it and checks the two agree.
-_lineage = resolve_canonical_rank1_lineage(CASE_STUDY)
+# `resolve_solvent_carrier` rather than the bare lineage resolver: same selection, and it
+# additionally refuses a selected configuration whose equity reached zero.
+_lineage = resolve_solvent_carrier(CASE_STUDY)
 _expected_holdout = _lineage["holdout_backtest_hash"]
 with sqlite3.connect(str(_db)) as _con:
     _tables = {r[0] for r in _con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -315,9 +335,18 @@ if (
     # The lineage is passed rather than re-derived inside. Left to itself the populator
     # ranks the registry on raw Sharpe, which is a fourth selector beside the resolver,
     # this notebook and the costs sweep - and here it picked the retired conformal
-    # generation, so the pairs described a carrier the case study does not report.
+    # generation, so the pairs described a selected configuration the case study does not report.
+    # The cohort call above is scoped to `LIVE_PREDICTIONS` and this one is not: the
+    # pairs are selected from every registered prediction set. Stated rather than
+    # defaulted; narrowing it changes published numbers and is
+    # ml4t/agent-workspace#1006. `replace_all=False` keeps the write additive, which
+    # is what this notebook has always done.
     _paired_rows = populate_paired_metrics(
-        CASE_STUDY, periods_per_year=PERIODS_PER_YEAR, carrier=_lineage
+        CASE_STUDY,
+        periods_per_year=PERIODS_PER_YEAR,
+        carrier=_lineage,
+        prediction_hashes=ENTIRE_REGISTRY,
+        replace_all=False,
     )
     _n_cohorts = sum(_cohort_counts[k] for k in ("family", "stagelabel", "label"))
     _n_pairs = sum(1 for row in _paired_rows if "skip" not in row)
@@ -361,7 +390,7 @@ else:
 # allocator variants are candidates and either can win.
 
 # %%
-rank1 = resolve_canonical_rank1_lineage(CASE_STUDY)
+rank1 = resolve_solvent_carrier(CASE_STUDY)
 TOP_HASH = rank1["val_backtest_hash"]
 TOP_PHASH = rank1["val_prediction_hash"]
 RANK1_STAGE = rank1["val_stage"]

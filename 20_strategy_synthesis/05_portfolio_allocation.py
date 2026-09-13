@@ -51,7 +51,6 @@ matches the caption "rank-1 signal held fixed" and the spine-pinning logic in
 """
 
 import json
-import warnings
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -66,8 +65,6 @@ from case_studies.utils.analytics import (
 )
 from utils.paths import get_chapter_dir
 from utils.style import show_with_alt
-
-warnings.filterwarnings("ignore")
 
 # %% tags=["parameters"]
 # 0 = all
@@ -90,9 +87,9 @@ def extract_top_k(spec_json: str) -> int:
 # vol, MVO, risk parity, score-weighted, HRP) while holding the signal
 # constant. We load the `stage: "allocation"` runs and restrict to the spine
 # prediction_hash per case study so the comparison reads as
-# "best within the highest-validation-Sharpe signal carrier".
+# "best within the highest-validation-Sharpe signal configuration".
 #
-# A case study absent from the carrier file is an error: `01_aggregate_synthesis`
+# A case study absent from the selected configuration file is an error: `01_aggregate_synthesis`
 # writes a row for every case study it iterates, so a missing key means the file
 # is stale. A case study present with a *null* spine is different: its registry
 # holds no backtests to resolve one from. It is named and excluded. The check
@@ -104,10 +101,12 @@ def extract_top_k(spec_json: str) -> int:
 # of that dict's nine entries had drifted from the shipped artifact - etfs 64
 # against 100, sp500_options 480 against 627, us_equities_panel 311 against 3199.
 
+# %% [markdown]
+# The spine prediction hash for each case study is read from the synthesis selection that
+# `01_aggregate_synthesis` writes. `backtest_comparison.parquet` is the canonical Chapter 20
+# artifact recording one spine prediction hash per case study.
+
 # %%
-# Spine prediction hash per case study — read from the synthesis carrier
-# file produced by 01_aggregate_synthesis. backtest_comparison.parquet is
-# the canonical Ch20 artifact that records spine_prediction_hash per CS.
 _spine_df = pl.read_parquet(get_chapter_dir(20) / "output" / "backtest_comparison.parquet").select(
     "case_study_id", "spine_prediction_hash"
 )
@@ -123,7 +122,7 @@ _missing_spine = [cs for cs in CS_LIST if cs not in SPINE_BY_CS]
 if _missing_spine:
     msg = (
         f"No spine_prediction_hash in backtest_comparison.parquet for: "
-        f"{_missing_spine}. Re-run 01_aggregate_synthesis to refresh the carrier."
+        f"{_missing_spine}. Re-run 01_aggregate_synthesis to refresh the spine hashes."
     )
     raise RuntimeError(msg)
 
@@ -131,12 +130,15 @@ NO_SPINE = sorted(cs for cs in CS_LIST if SPINE_BY_CS.get(cs) is None)
 if NO_SPINE:
     print(f"No resolved spine, excluded from the allocator comparison: {NO_SPINE}")
 
-# This section isolates the allocator layer: the signal is held fixed and only
-# the allocation method varies. Load the allocation stage ONLY — a trailing-stop
-# or other risk overlay (ch19) is a downstream layer, and including its Sharpe
-# would credit the allocator with work the overlay did, contradicting the
-# "allocator alone" measurement. The "max across rebalance and top-K variants"
-# in Table 20.6 is taken over allocation-stage variants, not over overlays.
+# %% [markdown]
+# This section isolates the allocator layer: the signal is held fixed and only the allocation
+# method varies. It loads the allocation stage and nothing downstream of it. A trailing stop or
+# any other Chapter 19 risk overlay is a later layer, and including its Sharpe here would credit
+# the allocator with work the overlay did, which is not the measurement this section claims to
+# make. The "max across rebalance and top-K variants" in Table 20.6 is taken over
+# allocation-stage variants for the same reason.
+
+# %%
 combined_raw = load_chapter_backtests(
     "ch17",
     case_studies=CS_LIST,
@@ -200,7 +202,7 @@ comparison = (
 
 # Collapse to one row per (case_study, allocator) — keep the configuration
 # (rebalance / top_k / overlay) that posts the highest Sharpe. Table 20.6
-# entries are the "best for that allocator" within the spine carrier.
+# entries are the "best for that allocator" within the spine configuration.
 comparison = comparison.sort("sharpe", descending=True).unique(
     subset=["case_study", "allocator"], keep="first"
 )
@@ -276,10 +278,12 @@ show_with_alt(
 )
 
 # %% [markdown]
-# **Interpretation**: The bar chart makes the cross-dataset heterogeneity immediately visible.
-# Case studies with strong signals show positive Sharpe regardless of allocator choice.
-# Case studies with weak signals show negative Sharpe across all allocators — no allocation
-# method can rescue a failing signal.
+# **Reading the chart**: one horizontal bar per case study, whose length is the Sharpe of that
+# case study's best allocator and whose label and colour name which allocator that was. Bars
+# are sorted by Sharpe, with a reference line at zero. Because each bar is already a maximum
+# over allocators, the chart compares case studies and says nothing about how much the
+# allocator choice was worth within one; the heatmap below reports every allocator per case
+# study and is where that comparison is read.
 
 # %% [markdown]
 # ## Equal-Weight Baseline vs Best Allocator
@@ -400,20 +404,18 @@ fig.colorbar(im, ax=ax, label="Sharpe Ratio", shrink=0.8)
 fig.subplots_adjust(left=0.18, right=0.92, top=0.9, bottom=0.2)
 show_with_alt(
     fig,
-    "Grouped bars comparing the Sharpe of each of the most common allocators "
-    "within each case study, so the height differences within a group show how "
-    "much the allocator choice moved the result.",
+    "Heatmap with one row per case study and one column per allocator, each cell "
+    "annotated with that pair's Sharpe and coloured red through green over the "
+    "range minus one to one, with untested pairs marked N/A.",
 )
 
 # %% [markdown]
-# **Interpretation**: The heatmap reveals that no single allocator dominates
-# across all case studies. Missing cells (N/A) indicate that not every
-# allocator was tested on every dataset — strategy-specific constraints
-# (e.g., long-only, no shorting) exclude certain methods. Green cells
-# (Sharpe > 0) cluster around a few case studies with strong underlying
-# signals, confirming that the upstream prediction quality matters more
-# than the allocation method. Red or near-zero cells indicate that even
-# the best allocator cannot rescue a weak signal.
+# **Reading the heatmap**: one row per case study, one column per allocator, coloured by
+# Sharpe. A missing cell (N/A) means that allocator was not tested on that dataset -
+# strategy-specific constraints such as long-only or no-shorting exclude certain methods - and
+# is a different thing from a cell whose Sharpe is near zero. Read across a row for how much
+# the allocator choice moved that case study, and down a column for whether one allocator
+# behaves consistently across markets.
 
 # %% [markdown]
 # ## Signal Strength vs Allocation Impact
@@ -437,7 +439,7 @@ print("Allocator Sharpe spread (best - worst) per case study:\n")
 spread_df.select("display_name", "best_sharpe", "worst_sharpe", "spread", "n_allocators")
 
 # %% [markdown]
-# **Interpretation**: The best-minus-worst spread is the cleanest summary of
+# **Interpretation**: The highest-minus-lowest spread is the cleanest summary of
 # allocator sensitivity. Wide spreads indicate that portfolio construction is
 # load-bearing for that dataset, while tight spreads indicate that upstream
 # signal quality dominates method choice.
@@ -565,20 +567,25 @@ else:
 # %% [markdown]
 # ## When Does Allocation Optimization Help?
 #
-# The previous sections show that allocation uplift varies across datasets.
-# Here we ask the structural question: **what predicts whether optimization
-# helps?** We hypothesize two factors:
+# The previous sections report allocation uplift per dataset. Here we ask the
+# structural question: **what predicts whether optimization helps?** We
+# hypothesize two factors:
 #
 # - **Signal strength** (EW baseline Sharpe): When the signal is strong,
 #   most allocators produce positive returns — optimization adds little.
 # - **Universe size**: In broad universes, allocation determines
 #   concentration; in narrow ones, top-$k$ selection dominates.
 #
-# The scatter below tests this hypothesis.
+# The scatter below tests this hypothesis, wherever enough case studies have both an
+# allocation uplift and an equal-weight baseline registered to place a point. When they do not,
+# the cell says which ones qualified instead of drawing it.
+
+# %% [markdown]
+# The structural features for the "when MVO helps" question come next. The equal-weight
+# baseline they measure uplift against is Chapter 16's baseline stage, not one of the Chapter 17
+# allocators, so the uplift is over doing no allocation work at all.
 
 # %%
-# Build structural features for the "when MVO helps" analysis.
-# The EW baseline comes from Ch16 (signal stage), not Ch17 allocators.
 ch16_raw = load_chapter_backtests("ch16", case_studies=CS_LIST, metrics=["sharpe"])
 ch16_ew = (
     ch16_raw.with_columns(
@@ -623,10 +630,9 @@ for row in mvo_data.iter_rows(named=True):
         }
     )
 
-# The schema is declared so an empty result is still a frame with these columns. A bare
-# `pl.DataFrame([])` has no columns at all, and the cells below then raise ColumnNotFoundError
-# on `ew_sharpe` rather than reporting that nothing qualified - which is what happened as soon
-# as the join above returned nothing.
+# The schema is declared so an empty result is still a frame with these columns: a bare
+# `pl.DataFrame([])` has none, and the cells below then raise ColumnNotFoundError on
+# `ew_sharpe` instead of reporting that nothing qualified.
 mvo_df = pl.DataFrame(
     mvo_rows,
     schema={
@@ -718,7 +724,13 @@ if mvo_df.height >= 3:
         "with quadrant annotations naming the four possible regimes.",
     )
 else:
-    print("Insufficient data for MVO diagnostic scatter.")
+    print(
+        f"The uplift-against-baseline scatter needs at least three case studies with both an "
+        f"allocation uplift and a registered equal-weight baseline; {mvo_df.height} qualified "
+        f"({', '.join(mvo_df['display_name'].to_list()) or 'none'}). The registries the "
+        f"missing case studies would supply are still being rebuilt, so this is an absent "
+        f"measurement rather than a negative result."
+    )
 
 # %% [markdown]
 #

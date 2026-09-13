@@ -85,11 +85,49 @@ def _frozen_names(path: Path) -> set[str]:
     `label_name` is a label with underscores replaced by dashes. Expanding that against
     the three declared labels is the point: a producer that fits one label while the
     consumer names three is exactly the defect, and it has to be visible here.
+
+    A producer may bind that f-string to a local first and pass the local, which is what
+    happens where the same name is also handed to `candidate_set_supersedes` - repeating
+    the literal at both call sites is how the two drift apart. So a bare `ast.Name` is
+    resolved against the module's assignments before it is given up on.
+
+    **Anything still unresolved fails the test rather than contributing nothing.** Returning
+    an empty set for a form the parser does not recognise makes every consumer name look
+    unfrozen, which reads as sixteen missing producers rather than as one unparsed call -
+    and that is exactly what a `name=<local>` call produced before this branch.
     """
     labels = ["fwd-ret-1d", "fwd-ret-5d", "fwd-ret-21d"]
     source = path.read_text()
     names: set[str] = set()
     tree = ast.parse(source)
+
+    bindings: dict[str, ast.expr] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    bindings[target.id] = node.value
+
+    def resolve(value: ast.expr, origin: str) -> None:
+        if isinstance(value, ast.Name):
+            bound = bindings.get(value.id)
+            if bound is None:
+                pytest.fail(f"{path.name}: freeze name {value.id!r} is never assigned")
+            resolve(bound, f"{origin} via {value.id}")
+            return
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            names.add(value.value)
+            return
+        if isinstance(value, ast.JoinedStr):
+            template = "".join(
+                part.value if isinstance(part, ast.Constant) else "{}" for part in value.values
+            )
+            if template.count("{}") != 1:
+                pytest.fail(f"{path.name}: cannot resolve freeze name {template!r}")
+            names.update(template.format(label) for label in labels)
+            return
+        pytest.fail(f"{path.name}: cannot resolve the freeze name at {origin}")
+
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -97,19 +135,8 @@ def _frozen_names(path: Path) -> set[str]:
         if not (isinstance(func, ast.Attribute) and func.attr == "freeze"):
             continue
         for keyword in node.keywords:
-            if keyword.arg != "name":
-                continue
-            value = keyword.value
-            if isinstance(value, ast.Constant):
-                names.add(value.value)
-            elif isinstance(value, ast.JoinedStr):
-                template = "".join(
-                    part.value if isinstance(part, ast.Constant) else "{}" for part in value.values
-                )
-                if template.count("{}") == 1:
-                    names.update(template.format(label) for label in labels)
-                else:
-                    pytest.fail(f"{path.name}: cannot resolve freeze name {template!r}")
+            if keyword.arg == "name":
+                resolve(keyword.value, f"line {keyword.value.lineno}")
     return names
 
 
@@ -138,31 +165,65 @@ def test_every_named_set_is_frozen_by_a_producer(
     )
 
 
+# How many labels each producer fits, which is what decides how many horizons a consumer may
+# name. `06_linear` and `07_gbm` take a `LABELS` parameter and loop, so they fit every declared
+# label. Every other producer reads `PRIMARY_LABEL or setup["labels"]["primary"]` and fits one,
+# and `13a_pca`/`13b_ipca` fit the labels whose `config/training/{label}.yaml` declares
+# `latent_factors`, which is the primary label alone. A name at a horizon its producer never
+# reaches raises in `15` and silently narrows the strategy chain in `16`; a producer fitting a
+# horizon no consumer names throws that fit away.
+ALL_HORIZONS = {"1d", "5d", "21d"}
+PRIMARY_HORIZON = {"1d"}
+EXPECTED_HORIZONS = {
+    "linear": ALL_HORIZONS,
+    "gbm": ALL_HORIZONS,
+    "tabular-dl": PRIMARY_HORIZON,
+    "nlinear": PRIMARY_HORIZON,
+    "lstm": PRIMARY_HORIZON,
+    "tsmixer": PRIMARY_HORIZON,
+    "pca": PRIMARY_HORIZON,
+    "ipca": PRIMARY_HORIZON,
+}
+
+
 def test_producers_cover_every_label_the_consumers_ask_for() -> None:
-    """A family named at three labels must be frozen at three labels.
+    """A family must be named at exactly the horizons its producer fits.
 
     The narrower version of this defect: `06` fits all three declared labels in one
     population, so a consumer naming only the 1-day set drops two thirds of what was
-    fitted, and drops it silently in `16`.
+    fitted, and drops it silently in `16`. The reverse costs more - a consumer naming a
+    horizon nothing freezes makes `CandidateSet.one` raise at the first cell of a stage
+    that has to run before any backtest exists.
     """
-    requested: set[str] = set()
+    # Per list, not over their union. The defect this test was written for is `16` naming no
+    # 5-day GBM set while `15` named one, and a union of the two consumers cannot see it.
     for consumer, parameters in CONSUMERS.items():
         for parameter in parameters:
-            requested.update(_literal_string_list(CASE_DIR / consumer, parameter))
+            requested = set(_literal_string_list(CASE_DIR / consumer, parameter))
 
-    by_family: dict[str, set[str]] = {}
-    for name in requested - PENDING_WEEKLY:
-        match = re.fullmatch(r"us-equities-fwd-ret-(\d+d)-(.+?)(-diagnostics)?-v1", name)
-        assert match, f"unrecognised set name shape: {name}"
-        horizon, family, diagnostics = match.groups()
-        by_family.setdefault(f"{family}{diagnostics or ''}", set()).add(horizon)
+            by_family: dict[str, set[str]] = {}
+            for name in requested - PENDING_WEEKLY:
+                match = re.fullmatch(r"us-equities-fwd-ret-(\d+d)-(.+?)(-diagnostics)?-v1", name)
+                assert match, f"{consumer}: unrecognised set name shape: {name}"
+                horizon, family, diagnostics = match.groups()
+                by_family.setdefault(f"{family}{diagnostics or ''}", set()).add(horizon)
 
-    multi_label = {"linear", "gbm", "linear-diagnostics", "gbm-diagnostics", "pca", "ipca"}
-    for family in sorted(multi_label & set(by_family)):
-        assert by_family[family] == {"1d", "5d", "21d"}, (
-            f"{family} is fitted on all three declared labels but named at "
-            f"{sorted(by_family[family])}"
-        )
+            unknown = sorted(
+                family
+                for family in by_family
+                if family.removesuffix("-diagnostics") not in EXPECTED_HORIZONS
+            )
+            assert not unknown, (
+                f"{consumer}: no declared horizon coverage for {unknown}. Add an "
+                "EXPECTED_HORIZONS entry saying how many labels the producer fits."
+            )
+
+            for family in sorted(by_family):
+                expected = EXPECTED_HORIZONS[family.removesuffix("-diagnostics")]
+                assert by_family[family] == expected, (
+                    f"{consumer} {parameter}: {family} is fitted at {sorted(expected)} "
+                    f"but named at {sorted(by_family[family])}"
+                )
 
 
 def test_diagnostic_sets_are_bounded() -> None:
